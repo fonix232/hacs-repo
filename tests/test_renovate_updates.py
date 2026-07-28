@@ -378,6 +378,62 @@ check(
 c = make(FakeSession(nodes(node(1, "x docker tag to v1", author=None))))
 check("null author does not crash", run(c._async_update_data()), {})
 
+print("\n== token lacking the Pull requests permission ==")
+# Exactly what GitHub returns for a fine-grained token with only Metadata and
+# Contents: HTTP 200, repository nulled by error propagation, FORBIDDEN on the
+# pullRequests path. Must surface as reauth, not an endless UpdateFailed retry.
+forbidden = FakeResponse(
+    200,
+    {
+        "data": {"repository": None},
+        "errors": [
+            {
+                "type": "FORBIDDEN",
+                "path": ["repository", "pullRequests"],
+                "message": "Resource not accessible by personal access token",
+            }
+        ],
+    },
+)
+c = make(FakeSession(forbidden))
+try:
+    run(c._async_update_data())
+    check("FORBIDDEN raises for reauth", "no raise", "ConfigEntryAuthFailed")
+except ConfigEntryAuthFailed as err:
+    check("FORBIDDEN raises for reauth", "Pull requests" in str(err), True)
+except UpdateFailed:
+    check("FORBIDDEN raises for reauth", "UpdateFailed", "ConfigEntryAuthFailed")
+
+# Same shape, but with only a message and no type field.
+message_only = FakeResponse(
+    200,
+    {
+        "data": {"repository": None},
+        "errors": [{"message": "Resource not accessible by personal access token"}],
+    },
+)
+try:
+    run(make(FakeSession(message_only))._async_update_data())
+    check("message-only FORBIDDEN raises", "no raise", "ConfigEntryAuthFailed")
+except ConfigEntryAuthFailed:
+    check(
+        "message-only FORBIDDEN raises",
+        "ConfigEntryAuthFailed",
+        "ConfigEntryAuthFailed",
+    )
+
+# An unrelated GraphQL error is a transient failure, not an auth problem.
+other = FakeResponse(
+    200, {"errors": [{"message": "timeout", "type": "SERVICE_UNAVAILABLE"}]}
+)
+try:
+    run(make(FakeSession(other))._async_update_data())
+    check("other errors stay UpdateFailed", "no raise", "UpdateFailed")
+except UpdateFailed:
+    check("other errors stay UpdateFailed", "UpdateFailed", "UpdateFailed")
+except ConfigEntryAuthFailed:
+    check("other errors stay UpdateFailed", "ConfigEntryAuthFailed", "UpdateFailed")
+
 print("\n== the regression that caused the silent failure ==")
 # A repository the token cannot see comes back null with no GraphQL error.
 # Treating that as "no open PRs" is what produced no entities and no logs.

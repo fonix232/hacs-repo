@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 import voluptuous as vol
@@ -50,21 +51,41 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# Reads the repository object directly. A repository the token cannot see comes
-# back as null, which is a definite answer -- unlike the `search` connection,
-# which returns an empty result set for both "no matches" and "cannot see it".
+# Deliberately reads pullRequests, not just repository metadata. A fine-grained
+# token with only Metadata and Contents can resolve nameWithOwner perfectly well
+# but is FORBIDDEN on pullRequests, so probing metadata alone would accept a
+# token that cannot do the one thing this integration exists to do.
 _PROBE = """
 query($owner: String!, $name: String!) {
   repository(owner: $owner, name: $name) {
     nameWithOwner
     viewerPermission
+    pullRequests(states: OPEN, first: 1) {
+      totalCount
+    }
   }
 }
 """
 
 
+def _permission_error(errors: list[dict]) -> bool:
+    """Return True when GitHub refused a field for lack of a token permission.
+
+    GraphQL answers with HTTP 200 and nulls the parent object, so the refusal
+    only shows up as a FORBIDDEN entry in the errors array.
+    """
+    return any(
+        error.get("type") in ("FORBIDDEN", "UNAUTHORIZED")
+        or "not accessible by personal access token" in (error.get("message") or "")
+        for error in errors
+    )
+
+
 async def _async_validate(hass, repository: str, token: str) -> str | None:
-    """Check the token can read the repository. Return an error key or None."""
+    """Check the token can read the repository's pull requests.
+
+    Returns a translation key for the error, or None when everything is usable.
+    """
     owner, _, name = repository.partition("/")
     if not owner or not name:
         return "invalid_repository"
@@ -89,11 +110,14 @@ async def _async_validate(hass, repository: str, token: str) -> str | None:
     except ClientError:
         return "cannot_connect"
 
-    if payload.get("errors"):
+    if errors := payload.get("errors"):
+        if _permission_error(errors):
+            return "missing_pr_permission"
+        _LOGGER.debug("Validation failed for %s: %s", repository, errors)
         return "invalid_repository"
 
-    # Null means the token authenticated but cannot see this repository, so
-    # accepting it here would produce an integration that silently finds nothing.
+    # Null without an error means the token authenticated but cannot see this
+    # repository at all; accepting it would produce a silently empty integration.
     if ((payload.get("data") or {}).get("repository")) is None:
         return "invalid_repository"
     return None
@@ -195,6 +219,42 @@ class RenovateConfigFlow(ConfigFlow, domain=DOMAIN):
                         CONF_MERGE_METHOD,
                         default=suggested.get(CONF_MERGE_METHOD, DEFAULT_MERGE_METHOD),
                     ): _merge_method_selector(),
+                }
+            ),
+        )
+
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
+        """Handle a token that stopped working."""
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Take a replacement token, keeping the rest of the entry intact."""
+        entry = self._get_reauth_entry()
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            if error := await _async_validate(
+                self.hass, entry.data[CONF_REPOSITORY], user_input[CONF_TOKEN]
+            ):
+                errors["base"] = error
+            else:
+                return self.async_update_reload_and_abort(
+                    entry, data_updates={CONF_TOKEN: user_input[CONF_TOKEN]}
+                )
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            errors=errors,
+            description_placeholders={"repository": entry.data[CONF_REPOSITORY]},
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_TOKEN): TextSelector(
+                        TextSelectorConfig(type=TextSelectorType.PASSWORD)
+                    )
                 }
             ),
         )

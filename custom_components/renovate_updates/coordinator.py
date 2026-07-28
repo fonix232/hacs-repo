@@ -208,6 +208,20 @@ class RenovateCoordinator(DataUpdateCoordinator[dict[str, RenovatePullRequest]])
 
         # GraphQL reports errors in the body with a 200 status.
         if errors := payload.get("errors"):
+            if any(
+                error.get("type") in ("FORBIDDEN", "UNAUTHORIZED")
+                or "not accessible by personal access token"
+                in (error.get("message") or "")
+                for error in errors
+            ):
+                # Almost always a fine-grained token without the Pull requests
+                # permission: Metadata and Contents alone resolve the repository
+                # but are refused on pullRequests. Raise for reauth rather than
+                # retrying forever, since no amount of waiting will fix it.
+                raise ConfigEntryAuthFailed(
+                    f"The token cannot read pull requests on {self._repository}. "
+                    "Grant it 'Pull requests: Read and write'."
+                )
             raise UpdateFailed(f"GitHub GraphQL error: {errors}")
 
         repository = (payload.get("data") or {}).get("repository")
