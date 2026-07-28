@@ -73,7 +73,11 @@ _mod(
 )
 _mod("homeassistant.helpers")
 
-from rutest.coordinator import RenovateCoordinator, _parse  # noqa: E402
+from rutest.coordinator import (  # noqa: E402
+    RenovateCoordinator,
+    _normalise_author,
+    _parse,
+)
 
 # --- fixtures ---------------------------------------------------------------
 BODY = """This PR contains the following updates:
@@ -140,24 +144,28 @@ class FakeSession:
         return self._response
 
 
-def make(session):
+def make(session, author="renovate[bot]"):
     return RenovateCoordinator(
         None,
         None,
         session,
         "octocat/infrastructure",
         "tok",
-        "app/renovate",
+        author,
         "squash",
         None,
     )
 
 
 def nodes(*ns):
-    return FakeResponse(200, {"data": {"search": {"nodes": list(ns)}}})
+    return FakeResponse(
+        200, {"data": {"repository": {"pullRequests": {"nodes": list(ns)}}}}
+    )
 
 
-def node(number, title, body="", draft=False, mergeable="MERGEABLE"):
+def node(
+    number, title, body="", draft=False, mergeable="MERGEABLE", author="renovate[bot]"
+):
     return {
         "number": number,
         "title": title,
@@ -165,6 +173,7 @@ def node(number, title, body="", draft=False, mergeable="MERGEABLE"):
         "isDraft": draft,
         "mergeable": mergeable,
         "url": f"https://github.com/octocat/infrastructure/pull/{number}",
+        "author": {"login": author} if author is not None else None,
     }
 
 
@@ -316,9 +325,68 @@ except UpdateFailed:
 print("\n== fetch: query is scoped correctly ==")
 s = FakeSession(nodes())
 run(make(s)._async_update_data())
-q = s.calls[0][2]["json"]["variables"]["q"]
-check("query", q, "repo:octocat/infrastructure is:pr is:open author:app/renovate")
+sent = s.calls[0][2]["json"]
+check("owner", sent["variables"]["owner"], "octocat")
+check("name", sent["variables"]["name"], "infrastructure")
+check("no search connection", "search(" in sent["query"], False)
+check("reads repository", "repository(" in sent["query"], True)
 check("auth header", s.calls[0][2]["headers"]["Authorization"], "Bearer tok")
+
+print("\n== author normalisation accepts every spelling ==")
+for spelling in ("renovate[bot]", "app/renovate", "Renovate", "  renovate[bot] "):
+    check(f"{spelling!r} normalises", _normalise_author(spelling), "renovate")
+
+print("\n== author filtering ==")
+c = make(
+    FakeSession(
+        nodes(
+            node(1, "chore(deps): update redis docker tag to v8.9.0"),
+            node(2, "feat: something I wrote", author="fonix232"),
+        )
+    )
+)
+check("only the bot's PRs", sorted(run(c._async_update_data())), ["redis"])
+
+# An entry configured before the switch stores the search-syntax spelling.
+c = make(
+    FakeSession(nodes(node(1, "chore(deps): update redis docker tag to v8.9.0"))),
+    author="app/renovate",
+)
+check(
+    "legacy app/renovate still matches", sorted(run(c._async_update_data())), ["redis"]
+)
+
+c = make(
+    FakeSession(
+        nodes(
+            node(1, "chore(deps): update redis docker tag to v8.9.0"),
+            node(
+                2,
+                "chore(deps): update apache/tika docker tag to v2.6.0",
+                author="someone-else",
+            ),
+        )
+    ),
+    author="",
+)
+check(
+    "empty author matches everything",
+    sorted(run(c._async_update_data())),
+    ["apache_tika", "redis"],
+)
+
+c = make(FakeSession(nodes(node(1, "x docker tag to v1", author=None))))
+check("null author does not crash", run(c._async_update_data()), {})
+
+print("\n== the regression that caused the silent failure ==")
+# A repository the token cannot see comes back null with no GraphQL error.
+# Treating that as "no open PRs" is what produced no entities and no logs.
+c = make(FakeSession(FakeResponse(200, {"data": {"repository": None}})))
+try:
+    run(c._async_update_data())
+    check("null repository raises", "no raise", "ConfigEntryAuthFailed")
+except ConfigEntryAuthFailed as err:
+    check("null repository raises", "access" in str(err), True)
 
 print("\n== merge ==")
 s = FakeSession(FakeResponse(200, text="{}"))

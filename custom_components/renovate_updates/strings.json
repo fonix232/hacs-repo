@@ -13,7 +13,7 @@
         "data_description": {
           "repository": "In owner/name form, for example octocat/infrastructure.",
           "token": "A fine-grained personal access token with Contents: read & write and Pull requests: read & write on this repository.",
-          "pr_author": "Leave as app/renovate for the hosted Mend Renovate app. Use the bot's username if you self-host Renovate.",
+          "pr_author": "The account that opens the pull requests. renovate[bot] is the hosted Mend Renovate app. Leave empty to match every open pull request, which is useful when nothing shows up.",
           "merge_method": "Must be enabled on the repository, or GitHub will refuse the merge."
         }
       }
@@ -42,7 +42,8 @@
         "data_description": {
           "scan_interval_minutes": "Used in polling mode.",
           "fallback_interval_minutes": "Used in webhook mode as a backstop for dropped deliveries. Set to 0 to rely on webhooks alone.",
-          "merge_method": "Must be enabled on the repository, or GitHub will refuse the merge."
+          "merge_method": "Must be enabled on the repository, or GitHub will refuse the merge.",
+          "pr_author": "The account that opens the pull requests, normally renovate[bot]. Leave empty to match every open pull request."
         }
       }
     }

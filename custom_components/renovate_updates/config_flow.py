@@ -50,13 +50,25 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-_PROBE = (
-    "query($q: String!) { search(query: $q, type: ISSUE, first: 1) { issueCount } }"
-)
+# Reads the repository object directly. A repository the token cannot see comes
+# back as null, which is a definite answer -- unlike the `search` connection,
+# which returns an empty result set for both "no matches" and "cannot see it".
+_PROBE = """
+query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    nameWithOwner
+    viewerPermission
+  }
+}
+"""
 
 
 async def _async_validate(hass, repository: str, token: str) -> str | None:
     """Check the token can read the repository. Return an error key or None."""
+    owner, _, name = repository.partition("/")
+    if not owner or not name:
+        return "invalid_repository"
+
     session = async_get_clientsession(hass)
     try:
         response = await session.post(
@@ -67,7 +79,7 @@ async def _async_validate(hass, repository: str, token: str) -> str | None:
                 "X-GitHub-Api-Version": API_VERSION,
                 "User-Agent": "home-assistant-renovate-updates",
             },
-            json={"query": _PROBE, "variables": {"q": f"repo:{repository} is:pr"}},
+            json={"query": _PROBE, "variables": {"owner": owner, "name": name}},
         )
         if response.status in (401, 403):
             return "invalid_auth"
@@ -78,7 +90,11 @@ async def _async_validate(hass, repository: str, token: str) -> str | None:
         return "cannot_connect"
 
     if payload.get("errors"):
-        # GraphQL reports an unreadable or missing repository here, with a 200.
+        return "invalid_repository"
+
+    # Null means the token authenticated but cannot see this repository, so
+    # accepting it here would produce an integration that silently finds nothing.
+    if ((payload.get("data") or {}).get("repository")) is None:
         return "invalid_repository"
     return None
 
@@ -149,7 +165,7 @@ class RenovateConfigFlow(ConfigFlow, domain=DOMAIN):
                         CONF_WEBHOOK_ID: webhook.async_generate_id(),
                     },
                     options={
-                        CONF_PR_AUTHOR: user_input[CONF_PR_AUTHOR],
+                        CONF_PR_AUTHOR: user_input.get(CONF_PR_AUTHOR, ""),
                         CONF_MERGE_METHOD: user_input[CONF_MERGE_METHOD],
                         CONF_UPDATE_METHOD: DEFAULT_UPDATE_METHOD,
                         CONF_SCAN_INTERVAL_MINUTES: DEFAULT_SCAN_INTERVAL_MINUTES,
@@ -171,7 +187,7 @@ class RenovateConfigFlow(ConfigFlow, domain=DOMAIN):
                     vol.Required(CONF_TOKEN): TextSelector(
                         TextSelectorConfig(type=TextSelectorType.PASSWORD)
                     ),
-                    vol.Required(
+                    vol.Optional(
                         CONF_PR_AUTHOR,
                         default=suggested.get(CONF_PR_AUTHOR, DEFAULT_PR_AUTHOR),
                     ): TextSelector(),
@@ -203,7 +219,7 @@ class RenovateOptionsFlow(OptionsFlow):
         if user_input is not None:
             return self.async_create_entry(
                 data={
-                    CONF_PR_AUTHOR: user_input[CONF_PR_AUTHOR],
+                    CONF_PR_AUTHOR: user_input.get(CONF_PR_AUTHOR, ""),
                     CONF_MERGE_METHOD: user_input[CONF_MERGE_METHOD],
                     CONF_UPDATE_METHOD: user_input[CONF_UPDATE_METHOD],
                     CONF_SCAN_INTERVAL_MINUTES: int(
@@ -244,7 +260,7 @@ class RenovateOptionsFlow(OptionsFlow):
                             DEFAULT_FALLBACK_INTERVAL_MINUTES,
                         ),
                     ): _minutes_selector(1440),
-                    vol.Required(
+                    vol.Optional(
                         CONF_PR_AUTHOR,
                         default=options.get(CONF_PR_AUTHOR, DEFAULT_PR_AUTHOR),
                     ): TextSelector(),

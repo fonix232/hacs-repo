@@ -1,13 +1,17 @@
 {
   "domain": "renovate_updates",
   "name": "Renovate Updates",
-  "codeowners": ["@fonix232"],
+  "codeowners": [
+    "@fonix232"
+  ],
   "config_flow": true,
-  "dependencies": ["webhook"],
+  "dependencies": [
+    "webhook"
+  ],
   "documentation": "https://github.com/fonix232/hacs-repo/tree/main/custom_components/renovate_updates",
   "integration_type": "service",
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/fonix232/hacs-repo/issues",
   "requirements": [],
-  "version": "0.1.0"
+  "version": "0.1.1"
 }
