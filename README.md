@@ -17,7 +17,15 @@ Home Assistant `config/custom_components/` and restart.
 
 | Integration | Description |
 |---|---|
-| _none yet_ | |
+| [Renovate Updates](custom_components/renovate_updates/) | Surfaces a repository's open [Renovate](https://docs.renovatebot.com/) pull requests as Home Assistant update entities, with the changelog as native release notes and a one-click merge. |
+
+## Development
+
+The tests stub Home Assistant out, so they run with nothing installed:
+
+```sh
+python3 tests/test_renovate_updates.py
+```
 
 ## Licence
 
