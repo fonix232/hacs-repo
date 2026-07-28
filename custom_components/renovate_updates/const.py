@@ -32,5 +32,9 @@ DEFAULT_FALLBACK_INTERVAL_MINUTES: Final = 60
 GITHUB_API: Final = "https://api.github.com"
 API_VERSION: Final = "2022-11-28"
 
-# Maximum pull requests to consider in one query.
+# Maximum open pull requests to consider in one query.
 PR_QUERY_LIMIT: Final = 50
+
+# How far back through merged pull requests to look when discovering which
+# dependencies exist. Only titles are fetched for these, so the cost is small.
+PR_HISTORY_LIMIT: Final = 100

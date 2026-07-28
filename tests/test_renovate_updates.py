@@ -11,6 +11,7 @@ import sys
 import tempfile
 import types
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO = Path(__file__).resolve().parent.parent
 SRC = REPO / "custom_components" / "renovate_updates"
@@ -66,6 +67,30 @@ _mod(
     ConfigEntryAuthFailed=ConfigEntryAuthFailed,
     HomeAssistantError=HomeAssistantError,
 )
+
+
+class Store:
+    """In-memory stand-in for homeassistant.helpers.storage.Store."""
+
+    _files: dict[str, object] = {}
+
+    def __init__(self, hass, version, key):
+        self._key = key
+
+    def __class_getitem__(cls, item):
+        return cls
+
+    async def async_load(self):
+        return Store._files.get(self._key)
+
+    async def async_save(self, data):
+        Store._files[self._key] = data
+
+    async def async_remove(self):
+        Store._files.pop(self._key, None)
+
+
+_mod("homeassistant.helpers.storage", Store=Store)
 _mod(
     "homeassistant.helpers.update_coordinator",
     DataUpdateCoordinator=DataUpdateCoordinator,
@@ -74,10 +99,36 @@ _mod(
 _mod("homeassistant.helpers")
 
 from rutest.coordinator import (  # noqa: E402
+    Dependency,
     RenovateCoordinator,
     _normalise_author,
-    _parse,
+    _parse_open,
 )
+
+
+def _parse(number, title, url, mergeable, body):
+    """Old flat shape, so the parsing assertions below stay readable."""
+    key, name, pull_request = _parse_open(
+        {
+            "number": number,
+            "title": title,
+            "url": url,
+            "mergeable": mergeable,
+            "body": body,
+        }
+    )
+    return SimpleNamespace(
+        key=key,
+        name=name,
+        number=pull_request.number,
+        url=pull_request.url,
+        mergeable=pull_request.mergeable,
+        body=pull_request.body,
+        installed_version=pull_request.installed_version,
+        latest_version=pull_request.latest_version,
+        has_conflict=pull_request.has_conflict,
+    )
+
 
 # --- fixtures ---------------------------------------------------------------
 BODY = """This PR contains the following updates:
@@ -144,10 +195,15 @@ class FakeSession:
         return self._response
 
 
-def make(session, author="renovate[bot]"):
+class FakeEntry:
+    def __init__(self, entry_id="test"):
+        self.entry_id = entry_id
+
+
+def make(session, author="renovate[bot]", entry_id="test"):
     return RenovateCoordinator(
         None,
-        None,
+        FakeEntry(entry_id),
         session,
         "octocat/infrastructure",
         "tok",
@@ -157,9 +213,17 @@ def make(session, author="renovate[bot]"):
     )
 
 
-def nodes(*ns):
+def nodes(*ns, merged=()):
     return FakeResponse(
-        200, {"data": {"repository": {"pullRequests": {"nodes": list(ns)}}}}
+        200,
+        {
+            "data": {
+                "repository": {
+                    "open": {"nodes": list(ns)},
+                    "merged": {"nodes": list(merged)},
+                }
+            }
+        },
     )
 
 
@@ -296,6 +360,7 @@ c = make(
 )
 data = run(c._async_update_data())
 check("only non-draft kept", sorted(data), ["redis"])
+check("has a pending PR", data["redis"].pull_request is not None, True)
 
 print("\n== fetch: two PRs for one dep -> newest wins ==")
 c = make(
@@ -308,7 +373,7 @@ c = make(
 )
 data = run(c._async_update_data())
 check("one entity", list(data), ["redis"])
-check("newer PR", data["redis"].number, 20)
+check("newer PR", data["redis"].pull_request.number, 20)
 
 print("\n== fetch: error handling ==")
 for status, exc, label in [
@@ -458,6 +523,90 @@ try:
     check("null repository raises", "no raise", "ConfigEntryAuthFailed")
 except ConfigEntryAuthFailed as err:
     check("null repository raises", "access" in str(err), True)
+
+print("\n== dependencies persist once their PR is merged ==")
+# The whole point of this design: an entity must not appear and disappear with
+# its pull request, because Home Assistant handles transient entities badly.
+session = FakeSession(nodes(node(1, "chore(deps): update redis docker tag to v8.9.0")))
+c = make(session, entry_id="persist")
+first = run(c._async_update_data())
+check("present while pending", sorted(first), ["redis"])
+check(
+    "pending shows an update",
+    first["redis"].installed_version != first["redis"].latest_version,
+    True,
+)
+
+# Next poll: the PR has been merged, so it is gone from the open set. The
+# dependency obviously still exists and its entity must not vanish with it.
+session._response = nodes()
+second = run(c._async_update_data())
+check("still present after merge", sorted(second), ["redis"])
+check("no pull request", second["redis"].pull_request, None)
+check(
+    "reports up to date",
+    second["redis"].installed_version == second["redis"].latest_version,
+    True,
+)
+
+print("\n== merged history discovers dependencies with nothing pending ==")
+c = make(
+    FakeSession(
+        nodes(
+            node(1, "chore(deps): update redis docker tag to v8.9.0"),
+            merged=[
+                node(90, "chore(deps): update apache/tika docker tag to v2.5.0"),
+                node(
+                    91,
+                    "chore(deps): update ghcr.io/jellyfin/jellyfin docker tag"
+                    " to v10.11.0",
+                ),
+            ],
+        )
+    ),
+    entry_id="history",
+)
+data = run(c._async_update_data())
+check(
+    "all three known",
+    sorted(data),
+    ["apache_tika", "ghcr_io_jellyfin_jellyfin", "redis"],
+)
+check("historic one is up to date", data["apache_tika"].pull_request, None)
+check("historic version from title", data["apache_tika"].installed_version, "v2.5.0")
+check("pending one still pending", data["redis"].pull_request is not None, True)
+
+print("\n== grouped PRs are not remembered as dependencies ==")
+c = make(
+    FakeSession(
+        nodes(merged=[node(80, "chore(deps): update all non-major dependencies")]),
+    ),
+    entry_id="grouped",
+)
+check("no phantom entity", sorted(run(c._async_update_data())), [])
+
+print("\n== remembered across a restart ==")
+c = make(
+    FakeSession(nodes(node(1, "chore(deps): update redis docker tag to v8.9.0"))),
+    entry_id="restart",
+)
+run(c._async_update_data())
+fresh = make(FakeSession(nodes()), entry_id="restart")
+run(fresh.async_load_known())
+check(
+    "survives a reload with nothing pending",
+    sorted(run(fresh._async_update_data())),
+    ["redis"],
+)
+
+print("\n== Dependency version fallbacks ==")
+d = Dependency(key="x", name="x", current_version=None, pull_request=None)
+check(
+    "unknown rather than None",
+    (d.installed_version, d.latest_version),
+    ("unknown", "unknown"),
+)
+check("equal means up to date", d.installed_version == d.latest_version, True)
 
 print("\n== merge ==")
 s = FakeSession(FakeResponse(200, text="{}"))

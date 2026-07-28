@@ -15,6 +15,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_TOKEN, CONF_WEBHOOK_ID, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.storage import Store
 
 from .const import (
     CONF_FALLBACK_INTERVAL_MINUTES,
@@ -31,7 +32,7 @@ from .const import (
     DOMAIN,
     UPDATE_METHOD_WEBHOOK,
 )
-from .coordinator import RenovateCoordinator
+from .coordinator import STORAGE_VERSION, RenovateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -80,6 +81,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: RenovateConfigEntry) -> 
         update_interval=_update_interval(entry),
     )
 
+    # Remembered dependencies must be in place before the first refresh, so a
+    # restart restores every entity rather than only those with a pending PR.
+    await coordinator.async_load_known()
     await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = coordinator
 
@@ -137,3 +141,9 @@ async def _async_reload_entry(hass: HomeAssistant, entry: RenovateConfigEntry) -
 async def async_unload_entry(hass: HomeAssistant, entry: RenovateConfigEntry) -> bool:
     """Unload a config entry."""
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: RenovateConfigEntry) -> None:
+    """Discard the remembered dependencies when the entry is deleted."""
+    store: Store = Store(hass, STORAGE_VERSION, f"{DOMAIN}.{entry.entry_id}")
+    await store.async_remove()
