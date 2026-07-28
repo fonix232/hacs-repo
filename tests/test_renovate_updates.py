@@ -85,7 +85,7 @@ BODY = """This PR contains the following updates:
 | Package | Type | Update | Change |
 |---|---|---|---|
 | [lscr.io/linuxserver/radarr](https://redirect.github.com/x) | final | minor | \
-`6.2.1.10461-ls309` -> `6.3.0.10500-ls310` |
+`6.2.1.10461-ls309` \u2192 `6.3.0.10500-ls310` |
 
 ---
 
@@ -193,7 +193,9 @@ check("name", pr.name, "lscr.io/linuxserver/radarr")
 check("key", pr.key, "lscr_io_linuxserver_radarr")
 
 print("\n== _parse: major bump, title lossy, table authoritative ==")
-b = BODY.replace("`6.2.1.10461-ls309` -> `6.3.0.10500-ls310`", "`1.2.5.1` -> `2.0.1`")
+b = BODY.replace(
+    "`6.2.1.10461-ls309` \u2192 `6.3.0.10500-ls310`", "`1.2.5.1` \u2192 `2.0.1`"
+)
 pr = _parse(
     104,
     "chore(deps): update ghcr.io/maziggy/bambuddy docker tag to v2",
@@ -214,6 +216,19 @@ pr = _parse(
 )
 check("latest", pr.latest_version, "v10.12.0")
 check("installed None", pr.installed_version, None)
+
+print("\n== every arrow Renovate has emitted ==")
+# U+2192 is what current Renovate writes; assuming ASCII "->" left
+# installed_version unset, which renders the entity with no state at all.
+for arrow, label in (
+    ("\u2192", "U+2192 (current Renovate)"),
+    ("->", "ASCII (older Renovate)"),
+    ("&rarr;", "HTML entity"),
+    ("&#8594;", "numeric entity"),
+):
+    b = f"| pkg | minor | `1.0.0` {arrow} `2.0.0` |"
+    pr = _parse(1, "chore(deps): update x/y docker tag to v2.0.0", "u", "MERGEABLE", b)
+    check(f"{label}", (pr.installed_version, pr.latest_version), ("1.0.0", "2.0.0"))
 
 print("\n== _parse: changelog prose with backticks + arrow must not match ==")
 pr = _parse(

@@ -114,13 +114,24 @@ class RenovateUpdateEntity(CoordinatorEntity[RenovateCoordinator], UpdateEntity)
 
     @property
     def installed_version(self) -> str | None:
-        """Return the version currently pinned in the repository."""
-        return self._pr.installed_version if self._pr else None
+        """Return the version currently pinned in the repository.
+
+        Falls back to a placeholder rather than None when the change table
+        cannot be parsed. Home Assistant renders no state at all if either
+        version is missing, which would leave an entity that cannot be acted
+        on; an unrecognised version still compares as "an update is available",
+        so the changelog and the merge button stay reachable.
+        """
+        if self._pr is None:
+            return None
+        return self._pr.installed_version or "unknown"
 
     @property
     def latest_version(self) -> str | None:
         """Return the version the pull request would move to."""
-        return self._pr.latest_version if self._pr else None
+        if self._pr is None:
+            return None
+        return self._pr.latest_version or "unknown"
 
     @property
     def release_url(self) -> str | None:

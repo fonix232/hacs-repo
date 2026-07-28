@@ -27,10 +27,18 @@ _DEP_RE = re.compile(
     r"update\s+(?:dependency\s+)?(\S+)\s+docker\s+(?:tag|digest)", re.I
 )
 
-# Renovate's change table: | ... | `1.2.3` -> `1.2.4` |
-# Anchored on backticks and the literal arrow, and forbidding newlines inside
-# the captures so prose in the changelog below cannot match by accident.
-_CHANGE_RE = re.compile(r"`([^`\n]+)`\s*->\s*`([^`\n]+)`")
+# Renovate's change table: | ... | `v3.3.0` → `v3.4.0` |
+#
+# Current Renovate renders a real arrow (U+2192); older versions emitted ASCII
+# "->", and the HTML entities turn up in bodies that have been round-tripped
+# through a renderer. Accept all of them -- getting this wrong leaves
+# installed_version unset, and Home Assistant shows an update entity with no
+# state at all when either version is missing.
+#
+# Anchored on backticks, with newlines excluded from the captures so prose in
+# the changelog below the table cannot match by accident.
+_ARROWS = r"(?:->|→|&rarr;|&#8594;)"
+_CHANGE_RE = re.compile(rf"`([^`\n]+)`\s*{_ARROWS}\s*`([^`\n]+)`")
 
 # Fallback when the body has no change table: the version from the title. This
 # is lossy on major bumps (Renovate writes "to v2" rather than "to v2.0.1").
