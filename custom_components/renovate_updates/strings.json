@@ -1,0 +1,65 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Renovate Updates",
+        "description": "Watch a repository for open Renovate pull requests and surface them as update entities.",
+        "data": {
+          "repository": "Repository",
+          "token": "GitHub token",
+          "pr_author": "Pull request author",
+          "merge_method": "Merge method"
+        },
+        "data_description": {
+          "repository": "In owner/name form, for example octocat/infrastructure.",
+          "token": "A fine-grained personal access token with Contents: read & write and Pull requests: read & write on this repository.",
+          "pr_author": "Leave as app/renovate for the hosted Mend Renovate app. Use the bot's username if you self-host Renovate.",
+          "merge_method": "Must be enabled on the repository, or GitHub will refuse the merge."
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not reach the GitHub API.",
+      "invalid_auth": "GitHub rejected the token.",
+      "invalid_repository": "The repository could not be read. Check the name and that the token has access to it."
+    },
+    "abort": {
+      "already_configured": "This repository is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Renovate Updates options",
+        "description": "Watching {repository}.\n\nTo use webhooks, add this payload URL to the repository under Settings > Webhooks, with content type application/json, subscribed to the Pull requests, Pushes and Check suites events:\n\n{webhook_url}\n\nThe payload is never read: a delivery only prompts a refresh, and the authenticated API call that follows is the source of truth.",
+        "data": {
+          "update_method": "How to detect changes",
+          "scan_interval_minutes": "Polling interval",
+          "fallback_interval_minutes": "Webhook fallback interval",
+          "pr_author": "Pull request author",
+          "merge_method": "Merge method"
+        },
+        "data_description": {
+          "scan_interval_minutes": "Used in polling mode.",
+          "fallback_interval_minutes": "Used in webhook mode as a backstop for dropped deliveries. Set to 0 to rely on webhooks alone.",
+          "merge_method": "Must be enabled on the repository, or GitHub will refuse the merge."
+        }
+      }
+    }
+  },
+  "selector": {
+    "update_method": {
+      "options": {
+        "poll": "Poll on a schedule",
+        "webhook": "Wait for a GitHub webhook"
+      }
+    },
+    "merge_method": {
+      "options": {
+        "squash": "Squash and merge",
+        "merge": "Create a merge commit",
+        "rebase": "Rebase and merge"
+      }
+    }
+  }
+}
