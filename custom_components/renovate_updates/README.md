@@ -4,21 +4,27 @@ Surfaces open [Renovate](https://docs.renovatebot.com/) pull requests as Home
 Assistant **update entities**, so a dependency bump can be reviewed and merged
 without opening GitHub.
 
-Each open pull request becomes one update entity:
+Each dependency becomes one update entity:
 
 | Update entity field | Source |
 |---|---|
 | `installed_version` | the `from` side of Renovate's change table |
-| `latest_version` | the `to` side of the change table |
+| `latest_version` | the `to` side of the change table, or the installed version when nothing is pending |
 | `title` | the dependency, e.g. `lscr.io/linuxserver/radarr` |
 | `release_url` | the pull request |
 | Release notes | the full pull request body, including the upstream changelogs Renovate collected |
 | Install button | merges the pull request |
 
-Entities are created when a pull request opens and removed when it is merged or
-closed, so the Updates card only ever shows work that is actually pending. The
-`unique_id` is keyed on the dependency rather than the pull request number, so
-successive bumps of the same image reuse the same entity.
+There is one permanent entity per dependency, not one per pull request. A
+dependency with a pending pull request reports an update; one without reports
+"up to date", with `installed_version` and `latest_version` equal. Entities are
+never removed as pull requests merge, because entities that appear and disappear
+make Home Assistant's registry churn and the UI flicker.
+
+Dependencies are discovered from open pull requests and from Renovate's merged
+history, and are then remembered in `.storage` so they survive both a restart
+and a quiet period with nothing pending. The `unique_id` is keyed on the
+dependency, so successive bumps of the same image reuse one entity.
 
 Because the integration implements `async_release_notes()`, the whole changelog
 renders natively in the more-info dialog. That is not reachable from YAML
@@ -88,7 +94,14 @@ fallback interval to `0` to rely on webhooks alone.
 - Only pull requests whose title matches Renovate's `update <dep> docker tag`
   form are mapped to a named dependency. Grouped pull requests, which cover
   several dependencies at once, fall back to one entity keyed on the pull
-  request itself.
+  request itself; those are not remembered once merged, since they do not
+  correspond to a lasting dependency.
+- A dependency is remembered for good. If you stop tracking one, delete its
+  entity from the entity registry.
+- The version shown for an up-to-date dependency is the best available guess:
+  the `from` side of its last open pull request, or the version in the title of
+  the last merged one. It becomes exact again as soon as a new pull request
+  opens.
 - Draft pull requests are ignored.
 - If Renovate's body has no change table, `latest_version` falls back to the
   version in the title, which is lossy on major bumps (`v2` rather than

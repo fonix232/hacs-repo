@@ -1,27 +1,20 @@
-"""Update entities for open Renovate pull requests."""
+"""Update entities for the dependencies Renovate manages."""
 
 from __future__ import annotations
 
 import logging
 from typing import Any
 
-from homeassistant.components.update import (
-    DOMAIN as UPDATE_DOMAIN,
-)
-from homeassistant.components.update import (
-    UpdateEntity,
-    UpdateEntityFeature,
-)
+from homeassistant.components.update import UpdateEntity, UpdateEntityFeature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import RenovateConfigEntry
 from .const import DOMAIN
-from .coordinator import RenovateCoordinator, RenovatePullRequest
+from .coordinator import Dependency, RenovateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -31,42 +24,32 @@ async def async_setup_entry(
     entry: RenovateConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up update entities, adding and removing them as PRs come and go."""
+    """Set up an update entity per dependency, adding new ones as they appear."""
     coordinator = entry.runtime_data
     known: set[str] = set()
 
     @callback
-    def _async_sync_entities() -> None:
-        """Reconcile the entity list with the pull requests currently open."""
-        current = set(coordinator.data or {})
+    def _async_add_new() -> None:
+        """Add entities for dependencies seen for the first time.
 
-        if added := current - known:
+        Entities are never removed here. A dependency whose pull request merged
+        still exists -- it is simply up to date -- and removing the entity would
+        make it flicker out of the registry on every merge, which Home Assistant
+        handles poorly. It reports "up to date" instead.
+        """
+        if new := set(coordinator.data or {}) - known:
             async_add_entities(
-                RenovateUpdateEntity(coordinator, entry, key) for key in sorted(added)
+                RenovateUpdateEntity(coordinator, entry, key) for key in sorted(new)
             )
-            known.update(added)
+            known.update(new)
+            _LOGGER.debug("Added %d new dependency entities", len(new))
 
-        # A merged or closed PR means there is nothing left to update, so drop
-        # the entity rather than leaving a stale row in the Updates card. The
-        # unique_id is keyed on the dependency, so the next PR for the same
-        # image reuses the same entity_id.
-        if removed := known - current:
-            registry = er.async_get(hass)
-            for key in removed:
-                unique_id = f"{entry.entry_id}_{key}"
-                if entity_id := registry.async_get_entity_id(
-                    UPDATE_DOMAIN, DOMAIN, unique_id
-                ):
-                    _LOGGER.debug("Removing %s; its pull request is closed", entity_id)
-                    registry.async_remove(entity_id)
-            known.difference_update(removed)
-
-    _async_sync_entities()
-    entry.async_on_unload(coordinator.async_add_listener(_async_sync_entities))
+    _async_add_new()
+    entry.async_on_unload(coordinator.async_add_listener(_async_add_new))
 
 
 class RenovateUpdateEntity(CoordinatorEntity[RenovateCoordinator], UpdateEntity):
-    """An open Renovate pull request, presented as an available update."""
+    """A dependency Renovate manages, updated by merging its pull request."""
 
     _attr_has_entity_name = True
     _attr_supported_features = (
@@ -93,62 +76,48 @@ class RenovateUpdateEntity(CoordinatorEntity[RenovateCoordinator], UpdateEntity)
         )
 
     @property
-    def _pr(self) -> RenovatePullRequest | None:
-        """Return the pull request backing this entity, if still open."""
+    def _dependency(self) -> Dependency | None:
+        """Return the dependency backing this entity."""
         return (self.coordinator.data or {}).get(self._key)
-
-    @property
-    def available(self) -> bool:
-        """Return True while the pull request is still open."""
-        return super().available and self._pr is not None
 
     @property
     def name(self) -> str | None:
         """Return the dependency name."""
-        return self._pr.name if self._pr else self._key
+        return dep.name if (dep := self._dependency) else self._key
 
     @property
     def title(self) -> str | None:
         """Return the dependency name, shown above the version numbers."""
-        return self._pr.name if self._pr else None
+        return dep.name if (dep := self._dependency) else None
 
     @property
     def installed_version(self) -> str | None:
-        """Return the version currently pinned in the repository.
-
-        Falls back to a placeholder rather than None when the change table
-        cannot be parsed. Home Assistant renders no state at all if either
-        version is missing, which would leave an entity that cannot be acted
-        on; an unrecognised version still compares as "an update is available",
-        so the changelog and the merge button stay reachable.
-        """
-        if self._pr is None:
-            return None
-        return self._pr.installed_version or "unknown"
+        """Return the version currently pinned in the repository."""
+        return dep.installed_version if (dep := self._dependency) else None
 
     @property
     def latest_version(self) -> str | None:
-        """Return the version the pull request would move to."""
-        if self._pr is None:
-            return None
-        return self._pr.latest_version or "unknown"
+        """Return the pending version, or the installed one when up to date."""
+        return dep.latest_version if (dep := self._dependency) else None
 
     @property
     def release_url(self) -> str | None:
-        """Return a link to the pull request."""
-        return self._pr.url if self._pr else None
+        """Return a link to the pending pull request, if there is one."""
+        dep = self._dependency
+        return dep.pull_request.url if dep and dep.pull_request else None
 
     @property
     def release_summary(self) -> str | None:
-        """Return a one-line summary.
+        """Return a one-line summary of the pending pull request.
 
         Home Assistant truncates this to 255 characters, so the detail lives in
         release_notes instead.
         """
-        if (pr := self._pr) is None:
+        dep = self._dependency
+        if dep is None or (pull_request := dep.pull_request) is None:
             return None
-        summary = f"PR #{pr.number}"
-        if pr.has_conflict:
+        summary = f"PR #{pull_request.number}"
+        if pull_request.has_conflict:
             summary += " — has merge conflicts"
         return summary
 
@@ -159,14 +128,18 @@ class RenovateUpdateEntity(CoordinatorEntity[RenovateCoordinator], UpdateEntity)
         upstream changelogs Renovate collected for every release between the
         installed and target versions.
         """
-        return self._pr.body if self._pr else None
+        dep = self._dependency
+        if dep is None or dep.pull_request is None:
+            return None
+        return dep.pull_request.body
 
     async def async_install(
         self, version: str | None, backup: bool, **kwargs: Any
     ) -> None:
-        """Merge the pull request."""
-        if (pr := self._pr) is None:
-            raise HomeAssistantError("The pull request is no longer open")
+        """Merge the pending pull request."""
+        dep = self._dependency
+        if dep is None or (pull_request := dep.pull_request) is None:
+            raise HomeAssistantError(f"No pending update for {self._key}")
 
-        await self.coordinator.async_merge_pull_request(pr.number)
+        await self.coordinator.async_merge_pull_request(pull_request.number)
         await self.coordinator.async_request_refresh()
