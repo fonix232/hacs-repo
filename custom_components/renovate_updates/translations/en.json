@@ -13,18 +13,27 @@
         "data_description": {
           "repository": "In owner/name form, for example octocat/infrastructure.",
           "token": "A fine-grained personal access token with Contents: read & write and Pull requests: read & write on this repository.",
-          "pr_author": "Leave as app/renovate for the hosted Mend Renovate app. Use the bot's username if you self-host Renovate.",
+          "pr_author": "The account that opens the pull requests. renovate[bot] is the hosted Mend Renovate app. Leave empty to match every open pull request, which is useful when nothing shows up.",
           "merge_method": "Must be enabled on the repository, or GitHub will refuse the merge."
+        }
+      },
+      "reauth_confirm": {
+        "title": "Renovate Updates",
+        "description": "The token for {repository} is no longer working. This is usually a fine-grained token missing 'Pull requests: Read and write'. Fix the token's permissions on GitHub and re-enter it, or paste a new one.",
+        "data": {
+          "token": "GitHub token"
         }
       }
     },
     "error": {
       "cannot_connect": "Could not reach the GitHub API.",
       "invalid_auth": "GitHub rejected the token.",
-      "invalid_repository": "The repository could not be read. Check the name and that the token has access to it."
+      "invalid_repository": "The repository could not be read. Check the name and that the token has access to it.",
+      "missing_pr_permission": "The token cannot read pull requests. A fine-grained token needs 'Pull requests: Read and write' as well as 'Contents: Read and write' \u2014 Contents alone is not enough."
     },
     "abort": {
-      "already_configured": "This repository is already configured."
+      "already_configured": "This repository is already configured.",
+      "reauth_successful": "The token was updated."
     }
   },
   "options": {
@@ -42,7 +51,8 @@
         "data_description": {
           "scan_interval_minutes": "Used in polling mode.",
           "fallback_interval_minutes": "Used in webhook mode as a backstop for dropped deliveries. Set to 0 to rely on webhooks alone.",
-          "merge_method": "Must be enabled on the repository, or GitHub will refuse the merge."
+          "merge_method": "Must be enabled on the repository, or GitHub will refuse the merge.",
+          "pr_author": "The account that opens the pull requests, normally renovate[bot]. Leave empty to match every open pull request."
         }
       }
     }

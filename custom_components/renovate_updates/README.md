@@ -45,14 +45,21 @@ Renovate Updates**.
 |---|---|
 | Repository | the repository Renovate runs against, as `owner/name` |
 | GitHub token | fine-grained PAT, see below |
-| Pull request author | `app/renovate` for the hosted Mend app; the bot's username if self-hosted |
+| Pull request author | `renovate[bot]` for the hosted Mend app; leave empty to match every open pull request |
 | Merge method | must be enabled on the repository or GitHub refuses the merge |
 
 The token is a fine-grained personal access token scoped to the repository with:
 
-- **Contents:** read & write — required to merge
-- **Pull requests:** read & write — required to merge
-- **Metadata:** read — implied
+| Permission | Level | Why |
+|---|---|---|
+| **Pull requests** | Read and write | Read the queue, and merge |
+| **Contents** | Read and write | Merging writes to the branch |
+| **Metadata** | Read | Implied by the above |
+
+**Pull requests is the one that is easy to miss.** Without it GitHub answers
+`FORBIDDEN` on the `pullRequests` field while still resolving the repository
+itself, so a token with only Contents and Metadata looks valid but can never see
+a single pull request. Setup rejects such a token rather than accepting it.
 
 ## Polling or webhook
 
@@ -88,5 +95,8 @@ fallback interval to `0` to rely on webhooks alone.
   `v2.0.1`), and `installed_version` is unknown.
 - A merge failure — a conflict, a disabled merge method, required checks not yet
   green — surfaces as an error in the UI with GitHub's response body.
+- If the token later loses access, or was granted too little, the integration
+  asks for a replacement through Home Assistant's reauthentication prompt rather
+  than retrying forever.
 - Brand assets are not included; those are only needed to list an integration in
   HACS's default store, not to install it as a custom repository.
