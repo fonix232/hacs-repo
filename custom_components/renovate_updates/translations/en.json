@@ -8,13 +8,15 @@
           "repository": "Repository",
           "token": "GitHub token",
           "pr_author": "Pull request author",
-          "merge_method": "Merge method"
+          "merge_method": "Merge method",
+          "merge_mode": "When Install is pressed"
         },
         "data_description": {
           "repository": "In owner/name form, for example octocat/infrastructure.",
           "token": "A fine-grained personal access token with Contents: read & write and Pull requests: read & write on this repository.",
           "pr_author": "The account that opens the pull requests. renovate[bot] is the hosted Mend Renovate app. Leave empty to match every open pull request, which is useful when nothing shows up.",
-          "merge_method": "Must be enabled on the repository, or GitHub will refuse the merge."
+          "merge_method": "Must be enabled on the repository, or GitHub will refuse the merge.",
+          "merge_mode": "Queue: merge pull requests one at a time in the background, retrying while GitHub re-checks the base branch and waiting for Renovate to rebase conflicts. Direct: one merge call, and any refusal is shown as an error."
         }
       },
       "reauth_confirm": {
@@ -46,13 +48,15 @@
           "scan_interval_minutes": "Polling interval",
           "fallback_interval_minutes": "Webhook fallback interval",
           "pr_author": "Pull request author",
-          "merge_method": "Merge method"
+          "merge_method": "Merge method",
+          "merge_mode": "When Install is pressed"
         },
         "data_description": {
           "scan_interval_minutes": "Used in polling mode.",
           "fallback_interval_minutes": "Used in webhook mode as a backstop for dropped deliveries. Set to 0 to rely on webhooks alone.",
           "merge_method": "Must be enabled on the repository, or GitHub will refuse the merge.",
-          "pr_author": "The account that opens the pull requests, normally renovate[bot]. Leave empty to match every open pull request."
+          "pr_author": "The account that opens the pull requests, normally renovate[bot]. Leave empty to match every open pull request.",
+          "merge_mode": "Queue: merge pull requests one at a time in the background, retrying while GitHub re-checks the base branch and waiting for Renovate to rebase conflicts. Direct: one merge call, and any refusal is shown as an error."
         }
       }
     }
@@ -69,6 +73,12 @@
         "squash": "Squash and merge",
         "merge": "Create a merge commit",
         "rebase": "Rebase and merge"
+      }
+    },
+    "merge_mode": {
+      "options": {
+        "queue": "Add to the merge queue",
+        "direct": "Merge immediately"
       }
     }
   }

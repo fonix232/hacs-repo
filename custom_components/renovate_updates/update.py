@@ -15,6 +15,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from . import RenovateConfigEntry
 from .const import DOMAIN
 from .coordinator import Dependency, RenovateCoordinator
+from .merge_queue import STATE_MERGING, STATE_REBASING, QueueEntry
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -52,9 +53,6 @@ class RenovateUpdateEntity(CoordinatorEntity[RenovateCoordinator], UpdateEntity)
     """A dependency Renovate manages, updated by merging its pull request."""
 
     _attr_has_entity_name = True
-    _attr_supported_features = (
-        UpdateEntityFeature.INSTALL | UpdateEntityFeature.RELEASE_NOTES
-    )
 
     def __init__(
         self,
@@ -65,6 +63,15 @@ class RenovateUpdateEntity(CoordinatorEntity[RenovateCoordinator], UpdateEntity)
         """Initialise the entity for one dependency."""
         super().__init__(coordinator)
         self._key = key
+        self._attr_supported_features = (
+            UpdateEntityFeature.INSTALL | UpdateEntityFeature.RELEASE_NOTES
+        )
+        if coordinator.queue is not None:
+            # With PROGRESS advertised, Home Assistant shows our own in_progress
+            # rather than the one it wraps around async_install. Ours stays on
+            # from the press of the button until the queue has merged the PR,
+            # while the install call itself returns as soon as it is queued.
+            self._attr_supported_features |= UpdateEntityFeature.PROGRESS
         self._attr_unique_id = f"{entry.entry_id}_{key}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry.entry_id)},
@@ -107,6 +114,34 @@ class RenovateUpdateEntity(CoordinatorEntity[RenovateCoordinator], UpdateEntity)
         return dep.pull_request.url if dep and dep.pull_request else None
 
     @property
+    def _queued(self) -> QueueEntry | None:
+        """Return the queue entry for the pending pull request, if queued."""
+        dep = self._dependency
+        queue = self.coordinator.queue
+        if queue is None or dep is None or dep.pull_request is None:
+            return None
+        return queue.entry_for(dep.pull_request.number)
+
+    @property
+    def in_progress(self) -> bool:
+        """Return True while the pending pull request sits in the merge queue."""
+        return self._queued is not None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Expose the pull request number and where it is in the merge queue."""
+        dep = self._dependency
+        if dep is None or (pull_request := dep.pull_request) is None:
+            return None
+        attributes: dict[str, Any] = {"pull_request": pull_request.number}
+        if (queue := self.coordinator.queue) is not None:
+            entry = queue.entry_for(pull_request.number)
+            attributes["queue_state"] = entry.state if entry else None
+            attributes["queue_position"] = queue.position(pull_request.number)
+            attributes["queue_error"] = queue.failure_for(pull_request.number)
+        return attributes
+
+    @property
     def release_summary(self) -> str | None:
         """Return a one-line summary of the pending pull request.
 
@@ -117,7 +152,19 @@ class RenovateUpdateEntity(CoordinatorEntity[RenovateCoordinator], UpdateEntity)
         if dep is None or (pull_request := dep.pull_request) is None:
             return None
         summary = f"PR #{pull_request.number}"
-        if pull_request.has_conflict:
+        queue = self.coordinator.queue
+        if queue is not None and (entry := queue.entry_for(pull_request.number)):
+            if entry.state == STATE_MERGING:
+                summary += " — merging"
+            elif entry.state == STATE_REBASING:
+                summary += " — queued, waiting for Renovate to rebase"
+            else:
+                summary += (
+                    f" — queued ({queue.position(pull_request.number)} of {len(queue)})"
+                )
+        elif queue is not None and (error := queue.failure_for(pull_request.number)):
+            summary += f" — merge failed: {error}"
+        elif pull_request.has_conflict:
             summary += " — has merge conflicts"
         return summary
 
@@ -136,10 +183,17 @@ class RenovateUpdateEntity(CoordinatorEntity[RenovateCoordinator], UpdateEntity)
     async def async_install(
         self, version: str | None, backup: bool, **kwargs: Any
     ) -> None:
-        """Merge the pending pull request."""
+        """Merge the pending pull request, or hand it to the merge queue."""
         dep = self._dependency
         if dep is None or (pull_request := dep.pull_request) is None:
             raise HomeAssistantError(f"No pending update for {self._key}")
+
+        if (queue := self.coordinator.queue) is not None:
+            # Returns at once; the worker merges in order and the entity shows
+            # progress through in_progress and the queue_* attributes. A PR
+            # already queued is left where it is.
+            await queue.async_enqueue(pull_request.number, self._key)
+            return
 
         await self.coordinator.async_merge_pull_request(pull_request.number)
         await self.coordinator.async_request_refresh()

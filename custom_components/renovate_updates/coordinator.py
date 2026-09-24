@@ -6,6 +6,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import timedelta
+from typing import TYPE_CHECKING
 
 from aiohttp import ClientError, ClientSession
 from homeassistant.config_entries import ConfigEntry
@@ -13,6 +14,9 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+
+if TYPE_CHECKING:
+    from .merge_queue import MergeQueue
 
 from .const import (
     API_VERSION,
@@ -45,6 +49,11 @@ _CHANGE_RE = re.compile(rf"`([^`\n]+)`\s*{_ARROWS}\s*`([^`\n]+)`")
 # Fallback when the body has no change table: the version from the title. This
 # is lossy on major bumps (Renovate writes "to v2" rather than "to v2.0.1").
 _TITLE_VERSION_RE = re.compile(r"docker\s+(?:tag|digest)\s+to\s+(\S+)", re.I)
+
+# Renovate's rebase/retry checkbox, unticked. Ticking it asks Renovate to
+# rebase the branch at its next run, which is the same thing it does on its own
+# for a conflicted PR, only prompted rather than waited for.
+_REBASE_CHECKBOX_RE = re.compile(r"-\s\[\s\](\s*<!--\s*rebase-check\s*-->)")
 
 STORAGE_VERSION = 1
 
@@ -80,6 +89,24 @@ query($owner: String!, $name: String!, $limit: Int!, $history: Int!) {
         title
         author { login }
       }
+    }
+  }
+}
+"""
+
+# What the merge queue needs to know about one pull request between passes.
+# GitHub computes `mergeable` lazily; asking for it is what prompts the
+# computation, so a PR that comes back UNKNOWN is usually MERGEABLE or
+# CONFLICTING on the next query.
+_PULL_REQUEST_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      state
+      mergeable
+      isDraft
+      headRefOid
+      body
     }
   }
 }
@@ -123,6 +150,41 @@ class RenovatePullRequest:
     def has_conflict(self) -> bool:
         """Return True when GitHub reports the PR as not mergeable."""
         return self.mergeable == "CONFLICTING"
+
+
+@dataclass(slots=True)
+class PullRequestStatus:
+    """The state of one pull request, as the merge queue sees it."""
+
+    state: str  # OPEN, MERGED or CLOSED
+    mergeable: str  # MERGEABLE, CONFLICTING or UNKNOWN
+    is_draft: bool
+    head_sha: str
+    body: str
+
+
+class MergeRefused(HomeAssistantError):
+    """GitHub answered the merge call with something other than success."""
+
+    def __init__(self, number: int, status: int, body: str) -> None:
+        """Record what GitHub said."""
+        super().__init__(
+            f"GitHub refused to merge PR #{number} (HTTP {status}): {body}"
+        )
+        self.number = number
+        self.status = status
+        self.body = body
+
+    @property
+    def transient(self) -> bool:
+        """Return True when the refusal may clear on its own.
+
+        405 is "not mergeable right now": a conflict, or GitHub still working
+        out mergeability after the base branch moved. 409 is a head that moved
+        since it was read. Both are worth another look; anything else, such as
+        a token without write access, is not.
+        """
+        return self.status in (405, 409)
 
 
 @dataclass(slots=True)
@@ -225,6 +287,9 @@ class RenovateCoordinator(DataUpdateCoordinator[dict[str, Dependency]]):
             hass, STORAGE_VERSION, f"{DOMAIN}.{entry.entry_id}"
         )
         self._known: dict[str, dict[str, str | None]] = {}
+        # Set by the integration when the entry runs in queue mode; None means
+        # the install button merges directly.
+        self.queue: MergeQueue | None = None
 
     @property
     def repository(self) -> str:
@@ -260,21 +325,20 @@ class RenovateCoordinator(DataUpdateCoordinator[dict[str, Dependency]]):
         author = ((node.get("author") or {}).get("login")) or ""
         return _normalise_author(author) == wanted
 
-    async def _async_update_data(self) -> dict[str, Dependency]:
-        """Fetch open pull requests, and rebuild the dependency list."""
+    async def _async_graphql(self, query: str, variables: dict) -> dict:
+        """Run a GraphQL query, returning its `data` object.
+
+        Raises ConfigEntryAuthFailed for anything a new token would fix and
+        UpdateFailed for everything else, so callers only ever see those two.
+        """
         owner, _, name = self._repository.partition("/")
         try:
             response = await self._session.post(
                 f"{GITHUB_API}/graphql",
                 headers=self._headers,
                 json={
-                    "query": _QUERY,
-                    "variables": {
-                        "owner": owner,
-                        "name": name,
-                        "limit": PR_QUERY_LIMIT,
-                        "history": PR_HISTORY_LIMIT,
-                    },
+                    "query": query,
+                    "variables": {"owner": owner, "name": name, **variables},
                 },
             )
             if response.status in (401, 403):
@@ -307,7 +371,14 @@ class RenovateCoordinator(DataUpdateCoordinator[dict[str, Dependency]]):
                 )
             raise UpdateFailed(f"GitHub GraphQL error: {errors}")
 
-        repository = (payload.get("data") or {}).get("repository")
+        return payload.get("data") or {}
+
+    async def _async_update_data(self) -> dict[str, Dependency]:
+        """Fetch open pull requests, and rebuild the dependency list."""
+        data = await self._async_graphql(
+            _QUERY, {"limit": PR_QUERY_LIMIT, "history": PR_HISTORY_LIMIT}
+        )
+        repository = data.get("repository")
         if repository is None:
             # A readable repository never comes back null, so this means the
             # token cannot see it -- which is an auth problem, not empty data.
@@ -401,10 +472,50 @@ class RenovateCoordinator(DataUpdateCoordinator[dict[str, Dependency]]):
             raise HomeAssistantError(f"Error merging PR #{number}: {err}") from err
 
         if response.status != 200:
-            # 405 = not mergeable (conflict, or the merge method is disabled on
-            # the repository), 409 = head changed since the SHA was read.
-            raise HomeAssistantError(
-                f"GitHub refused to merge PR #{number} (HTTP {response.status}): {body}"
-            )
+            # 405 = not mergeable (conflict, the base branch moved a moment ago,
+            # or the merge method is disabled on the repository), 409 = head
+            # changed since the SHA was read.
+            raise MergeRefused(number, response.status, body)
 
         _LOGGER.info("Merged PR #%d in %s", number, self._repository)
+
+    async def async_fetch_pull_request(self, number: int) -> PullRequestStatus | None:
+        """Return the current state of one pull request, or None if it is gone."""
+        data = await self._async_graphql(_PULL_REQUEST_QUERY, {"number": number})
+        node = (data.get("repository") or {}).get("pullRequest")
+        if node is None:
+            return None
+        return PullRequestStatus(
+            state=node.get("state") or "OPEN",
+            mergeable=node.get("mergeable") or "UNKNOWN",
+            is_draft=bool(node.get("isDraft")),
+            head_sha=node.get("headRefOid") or "",
+            body=node.get("body") or "",
+        )
+
+    async def async_request_rebase(self, number: int, body: str) -> bool:
+        """Tick Renovate's rebase/retry checkbox in the pull request body.
+
+        Returns False, without calling GitHub, when the body has no unticked
+        checkbox to tick: a PR that is not Renovate's, or one already asked.
+        """
+        new_body, ticked = _REBASE_CHECKBOX_RE.subn(r"- [x]\1", body, count=1)
+        if not ticked:
+            return False
+        try:
+            response = await self._session.patch(
+                f"{GITHUB_API}/repos/{self._repository}/pulls/{number}",
+                headers=self._headers,
+                json={"body": new_body},
+            )
+            text = await response.text()
+        except ClientError as err:
+            raise HomeAssistantError(
+                f"Error requesting a rebase of PR #{number}: {err}"
+            ) from err
+        if response.status != 200:
+            raise HomeAssistantError(
+                f"GitHub refused to edit PR #{number} (HTTP {response.status}): {text}"
+            )
+        _LOGGER.info("Asked Renovate to rebase PR #%d in %s", number, self._repository)
+        return True

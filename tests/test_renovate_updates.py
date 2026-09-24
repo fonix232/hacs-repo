@@ -21,7 +21,7 @@ PKG = Path(tempfile.mkdtemp()) / "rutest"
 shutil.rmtree(PKG, ignore_errors=True)
 PKG.mkdir(parents=True)
 (PKG / "__init__.py").write_text("")
-for f in ("const.py", "coordinator.py"):
+for f in ("const.py", "coordinator.py", "merge_queue.py"):
     shutil.copy(SRC / f, PKG / f)
 sys.path.insert(0, str(PKG.parent))
 
@@ -45,6 +45,14 @@ class DataUpdateCoordinator:
     ):
         self.hass, self.logger, self.name = hass, logger, name
         self.update_interval, self.config_entry = update_interval, config_entry
+        self.listener_updates = 0
+        self.refresh_requests = 0
+
+    def async_update_listeners(self):
+        self.listener_updates += 1
+
+    async def async_request_refresh(self):
+        self.refresh_requests += 1
 
     def __class_getitem__(cls, item):
         return cls
@@ -61,7 +69,7 @@ def _mod(name, **attrs):
 _mod("aiohttp", ClientError=ClientError, ClientSession=object)
 _mod("homeassistant")
 _mod("homeassistant.config_entries", ConfigEntry=object)
-_mod("homeassistant.core", HomeAssistant=object)
+_mod("homeassistant.core", HomeAssistant=object, callback=lambda f: f)
 _mod(
     "homeassistant.exceptions",
     ConfigEntryAuthFailed=ConfigEntryAuthFailed,
@@ -98,11 +106,19 @@ _mod(
 )
 _mod("homeassistant.helpers")
 
+from rutest.const import QUEUE_ENTRY_TIMEOUT_SECONDS  # noqa: E402
 from rutest.coordinator import (  # noqa: E402
     Dependency,
+    MergeRefused,
     RenovateCoordinator,
     _normalise_author,
     _parse_open,
+)
+from rutest.merge_queue import (  # noqa: E402
+    STATE_MERGING,
+    STATE_QUEUED,
+    STATE_REBASING,
+    MergeQueue,
 )
 
 
@@ -194,6 +210,36 @@ class FakeSession:
             raise self._response
         return self._response
 
+    async def patch(self, url, **kw):
+        self.calls.append(("PATCH", url, kw))
+        if isinstance(self._response, Exception):
+            raise self._response
+        return self._response
+
+
+class ScriptedSession(FakeSession):
+    """A session whose answer depends on the call, for multi-step flows."""
+
+    def __init__(self, handler):
+        super().__init__(None)
+        self._handler = handler
+
+    async def _dispatch(self, method, url, kw):
+        self.calls.append((method, url, kw))
+        result = self._handler(method, url, kw)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    async def post(self, url, **kw):
+        return await self._dispatch("POST", url, kw)
+
+    async def put(self, url, **kw):
+        return await self._dispatch("PUT", url, kw)
+
+    async def patch(self, url, **kw):
+        return await self._dispatch("PATCH", url, kw)
+
 
 class FakeEntry:
     def __init__(self, entry_id="test"):
@@ -241,7 +287,7 @@ def node(
     }
 
 
-run = asyncio.get_event_loop().run_until_complete
+run = asyncio.new_event_loop().run_until_complete
 
 print("== _parse: change table gives exact from -> to ==")
 pr = _parse(
@@ -632,6 +678,306 @@ try:
     check("merge network error raises", "no raise", "HomeAssistantError")
 except HomeAssistantError:
     check("merge network error raises", "HomeAssistantError", "HomeAssistantError")
+
+print("\n== merge refusals: which are worth retrying ==")
+for status, transient in ((405, True), (409, True), (403, False), (422, False)):
+    s = FakeSession(FakeResponse(status, text="refused"))
+    try:
+        run(make(s).async_merge_pull_request(42))
+        check(f"{status} raises MergeRefused", "no raise", "MergeRefused")
+    except MergeRefused as err:
+        check(f"{status} transient", err.transient, transient)
+
+print("\n== rebase request ticks exactly Renovate's checkbox ==")
+RENOVATE_FOOTER = (
+    "### Configuration\n\n"
+    "- [ ] <!-- rebase-check -->If you want to rebase/retry this PR, check this box\n"
+    "- [ ] some other box\n"
+)
+s = FakeSession(FakeResponse(200, text="{}"))
+check("asked", run(make(s).async_request_rebase(7, RENOVATE_FOOTER)), True)
+check(
+    "PATCH url",
+    s.calls[0][1],
+    "https://api.github.com/repos/octocat/infrastructure/pulls/7",
+)
+sent_body = s.calls[0][2]["json"]["body"]
+check("ticked", "- [x] <!-- rebase-check -->If you want" in sent_body, True)
+check("other box untouched", "- [ ] some other box" in sent_body, True)
+
+s = FakeSession(FakeResponse(200, text="{}"))
+check(
+    "no checkbox -> not asked",
+    run(make(s).async_request_rebase(7, "plain body")),
+    False,
+)
+check("no checkbox -> no call", s.calls, [])
+
+already = RENOVATE_FOOTER.replace("- [ ] <!--", "- [x] <!--")
+s = FakeSession(FakeResponse(200, text="{}"))
+check(
+    "already ticked -> not asked", run(make(s).async_request_rebase(7, already)), False
+)
+
+s = FakeSession(FakeResponse(403, text="nope"))
+try:
+    run(make(s).async_request_rebase(7, RENOVATE_FOOTER))
+    check("edit refused raises", "no raise", "HomeAssistantError")
+except HomeAssistantError:
+    check("edit refused raises", "HomeAssistantError", "HomeAssistantError")
+
+print("\n== merge queue ==")
+PR_URL = "https://api.github.com/repos/octocat/infrastructure/pulls/"
+
+
+def pr_status(state="OPEN", mergeable="MERGEABLE", sha="aaa", body="", draft=False):
+    return FakeResponse(
+        200,
+        {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "state": state,
+                        "mergeable": mergeable,
+                        "isDraft": draft,
+                        "headRefOid": sha,
+                        "body": body,
+                    }
+                }
+            }
+        },
+    )
+
+
+class GitHub:
+    """A scripted GitHub: per-PR status, and a log of merges and edits.
+
+    Merges succeed unless `refuse` is set, in which case that status is
+    returned; a successful merge flips the PR to MERGED, as GitHub does.
+    """
+
+    def __init__(self, prs):
+        self.prs = prs  # number -> FakeResponse from pr_status()
+        self.refuse = None  # HTTP status to answer merges with, or None
+        self.merged = []
+        self.edited = []
+
+    def __call__(self, method, url, kw):
+        if method == "POST":
+            number = kw["json"]["variables"]["number"]
+            if number not in self.prs:
+                return FakeResponse(
+                    200, {"data": {"repository": {"pullRequest": None}}}
+                )
+            return self.prs[number]
+        number = int(url.removeprefix(PR_URL).split("/")[0])
+        if method == "PUT":
+            if self.refuse:
+                return FakeResponse(self.refuse, text="Base branch was modified")
+            self.merged.append(number)
+            self.prs[number] = pr_status(state="MERGED")
+            return FakeResponse(200, text="{}")
+        if method == "PATCH":
+            self.edited.append((number, kw["json"]["body"]))
+            return FakeResponse(200, text="{}")
+        raise AssertionError(f"unexpected {method} {url}")
+
+
+def make_queue(github, entry_id="queue", clock=None):
+    session = ScriptedSession(github)
+    coordinator = make(session, entry_id=entry_id)
+    queue = MergeQueue(None, coordinator, Store(None, 1, f"queue.{entry_id}"))
+    if clock is not None:
+        queue._now = lambda: clock[0]
+    return queue, coordinator
+
+
+gh = GitHub({1: pr_status(), 2: pr_status()})
+q, c = make_queue(gh, "basic")
+check("enqueue", run(q.async_enqueue(1, "redis")), True)
+check("enqueue again is a no-op", run(q.async_enqueue(1, "redis")), False)
+run(q.async_enqueue(2, "tika"))
+check("positions", (q.position(1), q.position(2), q.position(3)), (1, 2, None))
+check("starts queued", q.entry_for(1).state, STATE_QUEUED)
+check("entities told", c.listener_updates >= 2, True)
+check(
+    "persisted", [e["number"] for e in Store._files["queue.basic"]["entries"]], [1, 2]
+)
+
+check("first pass merges one", run(q.async_process_once()), True)
+check("merged #1 only", gh.merged, [1])
+check("#2 still queued at the front", (q.position(2), len(q)), (1, 1))
+check("refresh requested after merge", c.refresh_requests, 1)
+check("second pass merges the other", run(q.async_process_once()), True)
+check("both merged in order", gh.merged, [1, 2])
+check("queue drained", len(q), 0)
+check("store drained", Store._files["queue.basic"]["entries"], [])
+check("no failures", (q.failure_for(1), q.failure_for(2)), (None, None))
+
+print("\n-- base branch moved: 405 is retried, not failed --")
+gh = GitHub({1: pr_status()})
+gh.refuse = 405
+q, c = make_queue(gh, "retry")
+run(q.async_enqueue(1, "redis"))
+check("pass without merge", run(q.async_process_once()), False)
+check("still queued", q.position(1), 1)
+check("back to queued", q.entry_for(1).state, STATE_QUEUED)
+check("one refusal counted", q.entry_for(1).refusals, 1)
+gh.refuse = None
+check("merges once GitHub catches up", run(q.async_process_once()), True)
+check("merged", gh.merged, [1])
+
+print("\n-- but not forever --")
+gh = GitHub({1: pr_status()})
+gh.refuse = 405
+q, c = make_queue(gh, "give-up")
+run(q.async_enqueue(1, "redis"))
+for _ in range(5):
+    run(q.async_process_once())
+check("dropped after repeated refusals", len(q), 0)
+check("reason kept", "405" in (q.failure_for(1) or ""), True)
+check("re-queue clears the failure", run(q.async_enqueue(1, "redis")), True)
+check("failure cleared", q.failure_for(1), None)
+
+print("\n-- a permanent refusal fails at once --")
+gh = GitHub({1: pr_status()})
+gh.refuse = 403
+q, c = make_queue(gh, "perm")
+run(q.async_enqueue(1, "redis"))
+run(q.async_process_once())
+check("dropped", len(q), 0)
+check("reason", "403" in (q.failure_for(1) or ""), True)
+
+print("\n-- conflict: ask Renovate once per head, merge after the rebase --")
+gh = GitHub({1: pr_status(mergeable="CONFLICTING", sha="old", body=RENOVATE_FOOTER)})
+q, c = make_queue(gh, "conflict")
+run(q.async_enqueue(1, "redis"))
+check("no merge", run(q.async_process_once()), False)
+check("state", q.entry_for(1).state, STATE_REBASING)
+check("checkbox ticked once", len(gh.edited), 1)
+check("ticked body", "- [x] <!-- rebase-check -->" in gh.edited[0][1], True)
+check("remembered for this head", q.entry_for(1).rebase_requested_for, "old")
+check(
+    "remembered across a restart",
+    Store._files["queue.conflict"]["entries"][0]["rebase_requested_for"],
+    "old",
+)
+run(q.async_process_once())
+check("not asked again for the same head", len(gh.edited), 1)
+check("no merge attempted while conflicting", gh.merged, [])
+# Renovate rebased: new head, mergeable again.
+gh.prs[1] = pr_status(mergeable="MERGEABLE", sha="new", body=RENOVATE_FOOTER)
+check("merges the rebased head", run(q.async_process_once()), True)
+check("merged", gh.merged, [1])
+
+print("\n-- conflict without a checkbox: just wait --")
+gh = GitHub({1: pr_status(mergeable="CONFLICTING", sha="old", body="hand-made PR")})
+q, c = make_queue(gh, "no-box")
+run(q.async_enqueue(1, "pr_1"))
+run(q.async_process_once())
+check("no edit", gh.edited, [])
+check(
+    "still queued, waiting", (q.position(1), q.entry_for(1).state), (1, STATE_REBASING)
+)
+
+print("\n-- UNKNOWN: GitHub is still thinking --")
+gh = GitHub({1: pr_status(mergeable="UNKNOWN")})
+q, c = make_queue(gh, "unknown")
+run(q.async_enqueue(1, "redis"))
+run(q.async_process_once())
+check("nothing merged", gh.merged, [])
+check("waits", q.entry_for(1).state, STATE_QUEUED)
+gh.prs[1] = pr_status()
+check("merges once known", run(q.async_process_once()), True)
+
+print("\n-- merged by hand, closed, deleted, draft --")
+gh = GitHub(
+    {
+        1: pr_status(state="MERGED"),
+        2: pr_status(state="CLOSED"),
+        4: pr_status(draft=True),
+        5: pr_status(),
+    }
+)
+q, c = make_queue(gh, "gone")
+for number in (1, 2, 3, 4, 5):
+    run(q.async_enqueue(number, f"pr_{number}"))
+check("the live one merges", run(q.async_process_once()), True)
+check("queue empty", len(q), 0)
+check("merged by hand is not a failure", q.failure_for(1), None)
+check("closed is", "closed" in (q.failure_for(2) or ""), True)
+check("deleted is not a failure", q.failure_for(3), None)
+check("draft is", "draft" in (q.failure_for(4) or ""), True)
+check("only the live PR was merged", gh.merged, [5])
+
+print("\n-- a PR nobody rebases is eventually dropped --")
+clock = [1_000_000.0]
+gh = GitHub({1: pr_status(mergeable="CONFLICTING", body="x")})
+q, c = make_queue(gh, "timeout", clock)
+run(q.async_enqueue(1, "redis"))
+run(q.async_process_once())
+check("waiting", len(q), 1)
+clock[0] += QUEUE_ENTRY_TIMEOUT_SECONDS + 1
+run(q.async_process_once())
+check("dropped", len(q), 0)
+check("reason", "gave up" in (q.failure_for(1) or ""), True)
+
+print("\n-- GitHub unreachable: the pass aborts and nothing is lost --")
+gh = GitHub({1: pr_status(), 2: pr_status()})
+q, c = make_queue(gh, "down")
+run(q.async_enqueue(1, "redis"))
+run(q.async_enqueue(2, "tika"))
+good = gh.__call__
+gh_calls = [0]
+
+
+def flaky(method, url, kw):
+    gh_calls[0] += 1
+    return ClientError("down")
+
+
+q._coordinator._session._handler = flaky
+check("no merge", run(q.async_process_once()), False)
+check("stopped at the first failure", gh_calls[0], 1)
+check("entries intact", (q.position(1), q.position(2)), (1, 2))
+q._coordinator._session._handler = good
+run(q.async_process_once())
+run(q.async_process_once())
+check("recovers", gh.merged, [1, 2])
+
+print("\n-- the queue survives a restart --")
+gh = GitHub({1: pr_status(), 2: pr_status()})
+q, c = make_queue(gh, "restart-queue")
+run(q.async_enqueue(1, "redis"))
+run(q.async_enqueue(2, "tika"))
+q2, c2 = make_queue(gh, "restart-queue")
+check("empty before load", len(q2), 0)
+run(q2.async_load())
+check("restored in order", [e.number for e in q2.entries], [1, 2])
+check("keys restored", [e.key for e in q2.entries], ["redis", "tika"])
+run(q2.async_process_once())
+run(q2.async_process_once())
+check("resumes", gh.merged, [1, 2])
+
+print("\n-- state while merging is visible --")
+# The merge call itself is where the entity would read "merging" from; make
+# GitHub check the state mid-call.
+seen = []
+gh = GitHub({1: pr_status()})
+q, c = make_queue(gh, "state")
+inner = gh.__call__
+
+
+def spy(method, url, kw):
+    if method == "PUT":
+        seen.append(q.entry_for(1).state)
+    return inner(method, url, kw)
+
+
+q._coordinator._session._handler = spy
+run(q.async_enqueue(1, "redis"))
+run(q.async_process_once())
+check("merging during the call", seen, [STATE_MERGING])
 
 print()
 print("ALL PASS" if not FAILS else f"{len(FAILS)} FAILURES: {FAILS}")

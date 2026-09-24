@@ -20,25 +20,34 @@ from homeassistant.helpers.storage import Store
 from .const import (
     CONF_FALLBACK_INTERVAL_MINUTES,
     CONF_MERGE_METHOD,
+    CONF_MERGE_MODE,
     CONF_PR_AUTHOR,
     CONF_REPOSITORY,
     CONF_SCAN_INTERVAL_MINUTES,
     CONF_UPDATE_METHOD,
     DEFAULT_FALLBACK_INTERVAL_MINUTES,
     DEFAULT_MERGE_METHOD,
+    DEFAULT_MERGE_MODE,
     DEFAULT_PR_AUTHOR,
     DEFAULT_SCAN_INTERVAL_MINUTES,
     DEFAULT_UPDATE_METHOD,
     DOMAIN,
+    MERGE_MODE_QUEUE,
     UPDATE_METHOD_WEBHOOK,
 )
 from .coordinator import STORAGE_VERSION, RenovateCoordinator
+from .merge_queue import MergeQueue
 
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [Platform.UPDATE]
 
 RenovateConfigEntry = ConfigEntry[RenovateCoordinator]
+
+
+def _queue_store(hass: HomeAssistant, entry: ConfigEntry) -> Store:
+    """Return the store holding the entry's pending merge queue."""
+    return Store(hass, STORAGE_VERSION, f"{DOMAIN}.{entry.entry_id}.queue")
 
 
 def _option(entry: ConfigEntry, key: str, default):
@@ -86,6 +95,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: RenovateConfigEntry) -> 
     await coordinator.async_load_known()
     await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = coordinator
+
+    if _option(entry, CONF_MERGE_MODE, DEFAULT_MERGE_MODE) == MERGE_MODE_QUEUE:
+        queue = MergeQueue(hass, coordinator, _queue_store(hass, entry))
+        await queue.async_load()
+        coordinator.queue = queue
+        # A refresh (poll or webhook) means something changed on GitHub, which
+        # is exactly when the queue should look again rather than wait out its
+        # backoff. The task is cancelled with the entry on unload.
+        entry.async_on_unload(coordinator.async_add_listener(queue.async_wake))
+        entry.async_create_background_task(
+            hass,
+            queue.async_run(),
+            name=f"{DOMAIN} merge queue ({coordinator.repository})",
+        )
 
     if (
         _option(entry, CONF_UPDATE_METHOD, DEFAULT_UPDATE_METHOD)
@@ -147,3 +170,4 @@ async def async_remove_entry(hass: HomeAssistant, entry: RenovateConfigEntry) ->
     """Discard the remembered dependencies when the entry is deleted."""
     store: Store = Store(hass, STORAGE_VERSION, f"{DOMAIN}.{entry.entry_id}")
     await store.async_remove()
+    await _queue_store(hass, entry).async_remove()

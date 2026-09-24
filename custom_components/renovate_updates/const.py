@@ -9,6 +9,7 @@ DOMAIN: Final = "renovate_updates"
 CONF_REPOSITORY: Final = "repository"
 CONF_PR_AUTHOR: Final = "pr_author"
 CONF_MERGE_METHOD: Final = "merge_method"
+CONF_MERGE_MODE: Final = "merge_mode"
 CONF_UPDATE_METHOD: Final = "update_method"
 CONF_SCAN_INTERVAL_MINUTES: Final = "scan_interval_minutes"
 CONF_FALLBACK_INTERVAL_MINUTES: Final = "fallback_interval_minutes"
@@ -19,8 +20,17 @@ UPDATE_METHODS: Final = [UPDATE_METHOD_POLL, UPDATE_METHOD_WEBHOOK]
 
 MERGE_METHODS: Final = ["squash", "merge", "rebase"]
 
+# How the install button lands a pull request. "queue" hands it to the
+# integration's own merge queue, which merges one PR at a time and rides out
+# GitHub's post-merge mergeability recompute and Renovate's rebases. "direct"
+# is the original behaviour: one merge call, and any refusal is an error.
+MERGE_MODE_QUEUE: Final = "queue"
+MERGE_MODE_DIRECT: Final = "direct"
+MERGE_MODES: Final = [MERGE_MODE_QUEUE, MERGE_MODE_DIRECT]
+
 DEFAULT_PR_AUTHOR: Final = "renovate[bot]"
 DEFAULT_MERGE_METHOD: Final = "squash"
+DEFAULT_MERGE_MODE: Final = MERGE_MODE_QUEUE
 DEFAULT_UPDATE_METHOD: Final = UPDATE_METHOD_POLL
 DEFAULT_SCAN_INTERVAL_MINUTES: Final = 30
 
@@ -38,3 +48,19 @@ PR_QUERY_LIMIT: Final = 50
 # How far back through merged pull requests to look when discovering which
 # dependencies exist. Only titles are fetched for these, so the cost is small.
 PR_HISTORY_LIMIT: Final = 100
+
+# Merge queue pacing. After every pass the worker sleeps for the next value in
+# this ladder, restarting from the front whenever something was merged, so a
+# burst of ready PRs lands quickly while a PR waiting on Renovate is polled
+# gently. GitHub recomputes mergeability lazily, and the queries themselves
+# prompt it to do so.
+QUEUE_BACKOFF_SECONDS: Final = (5, 10, 20, 30, 60, 120, 300)
+
+# A queued pull request that has not merged after this long is dropped and
+# reported as failed, so a PR Renovate never rebases cannot sit forever.
+QUEUE_ENTRY_TIMEOUT_SECONDS: Final = 6 * 60 * 60
+
+# A pull request GitHub calls MERGEABLE but refuses to merge this many passes in
+# a row is misconfigured (usually a merge method the repository disables), not
+# merely racing the base branch.
+QUEUE_MAX_MERGE_REFUSALS: Final = 5

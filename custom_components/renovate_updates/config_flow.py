@@ -34,18 +34,21 @@ from .const import (
     API_VERSION,
     CONF_FALLBACK_INTERVAL_MINUTES,
     CONF_MERGE_METHOD,
+    CONF_MERGE_MODE,
     CONF_PR_AUTHOR,
     CONF_REPOSITORY,
     CONF_SCAN_INTERVAL_MINUTES,
     CONF_UPDATE_METHOD,
     DEFAULT_FALLBACK_INTERVAL_MINUTES,
     DEFAULT_MERGE_METHOD,
+    DEFAULT_MERGE_MODE,
     DEFAULT_PR_AUTHOR,
     DEFAULT_SCAN_INTERVAL_MINUTES,
     DEFAULT_UPDATE_METHOD,
     DOMAIN,
     GITHUB_API,
     MERGE_METHODS,
+    MERGE_MODES,
     UPDATE_METHODS,
 )
 
@@ -133,6 +136,16 @@ def _merge_method_selector() -> SelectSelector:
     )
 
 
+def _merge_mode_selector() -> SelectSelector:
+    return SelectSelector(
+        SelectSelectorConfig(
+            options=MERGE_MODES,
+            mode=SelectSelectorMode.LIST,
+            translation_key="merge_mode",
+        )
+    )
+
+
 def _update_method_selector() -> SelectSelector:
     return SelectSelector(
         SelectSelectorConfig(
@@ -191,6 +204,7 @@ class RenovateConfigFlow(ConfigFlow, domain=DOMAIN):
                     options={
                         CONF_PR_AUTHOR: user_input.get(CONF_PR_AUTHOR, ""),
                         CONF_MERGE_METHOD: user_input[CONF_MERGE_METHOD],
+                        CONF_MERGE_MODE: user_input[CONF_MERGE_MODE],
                         CONF_UPDATE_METHOD: DEFAULT_UPDATE_METHOD,
                         CONF_SCAN_INTERVAL_MINUTES: DEFAULT_SCAN_INTERVAL_MINUTES,
                         CONF_FALLBACK_INTERVAL_MINUTES: (
@@ -219,6 +233,10 @@ class RenovateConfigFlow(ConfigFlow, domain=DOMAIN):
                         CONF_MERGE_METHOD,
                         default=suggested.get(CONF_MERGE_METHOD, DEFAULT_MERGE_METHOD),
                     ): _merge_method_selector(),
+                    vol.Required(
+                        CONF_MERGE_MODE,
+                        default=suggested.get(CONF_MERGE_MODE, DEFAULT_MERGE_MODE),
+                    ): _merge_mode_selector(),
                 }
             ),
         )
@@ -281,6 +299,7 @@ class RenovateOptionsFlow(OptionsFlow):
                 data={
                     CONF_PR_AUTHOR: user_input.get(CONF_PR_AUTHOR, ""),
                     CONF_MERGE_METHOD: user_input[CONF_MERGE_METHOD],
+                    CONF_MERGE_MODE: user_input[CONF_MERGE_MODE],
                     CONF_UPDATE_METHOD: user_input[CONF_UPDATE_METHOD],
                     CONF_SCAN_INTERVAL_MINUTES: int(
                         user_input[CONF_SCAN_INTERVAL_MINUTES]
@@ -328,6 +347,10 @@ class RenovateOptionsFlow(OptionsFlow):
                         CONF_MERGE_METHOD,
                         default=options.get(CONF_MERGE_METHOD, DEFAULT_MERGE_METHOD),
                     ): _merge_method_selector(),
+                    vol.Required(
+                        CONF_MERGE_MODE,
+                        default=options.get(CONF_MERGE_MODE, DEFAULT_MERGE_MODE),
+                    ): _merge_mode_selector(),
                 }
             ),
         )

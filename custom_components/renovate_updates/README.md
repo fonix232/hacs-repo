@@ -13,7 +13,7 @@ Each dependency becomes one update entity:
 | `title` | the dependency, e.g. `lscr.io/linuxserver/radarr` |
 | `release_url` | the pull request |
 | Release notes | the full pull request body, including the upstream changelogs Renovate collected |
-| Install button | merges the pull request |
+| Install button | queues the pull request for merging (or merges it directly, see below) |
 
 There is one permanent entity per dependency, not one per pull request. A
 dependency with a pending pull request reports an update; one without reports
@@ -53,6 +53,7 @@ Renovate Updates**.
 | GitHub token | fine-grained PAT, see below |
 | Pull request author | `renovate[bot]` for the hosted Mend app; leave empty to match every open pull request |
 | Merge method | must be enabled on the repository or GitHub refuses the merge |
+| When Install is pressed | *Add to the merge queue* (default) or *Merge immediately*, see below |
 
 The token is a fine-grained personal access token scoped to the repository with:
 
@@ -66,6 +67,36 @@ The token is a fine-grained personal access token scoped to the repository with:
 `FORBIDDEN` on the `pullRequests` field while still resolving the repository
 itself, so a token with only Contents and Metadata looks valid but can never see
 a single pull request. Setup rejects such a token rather than accepting it.
+
+## The merge queue
+
+GitHub's own merge queue is only offered on public repositories and paid plans,
+so the integration carries a small one of its own. With **Add to the merge
+queue** selected, pressing Install on several entities in a row queues their
+pull requests and returns straight away; a background worker then merges them
+one at a time, in the order they were pressed. The entity shows a progress
+spinner while its pull request is queued, and its `queue_state`,
+`queue_position` and `queue_error` attributes say where it is.
+
+Merging one at a time is what makes a batch land without babysitting:
+
+- After every merge GitHub recomputes the mergeability of every other open pull
+  request, and refuses a merge call made in that window with `405 Base branch
+  was modified`. The worker looks again a few seconds later instead of failing.
+- Renovate pull requests that edit neighbouring lines of the same file conflict
+  the moment the first of them merges. The worker ticks the pull request's
+  *rebase/retry* checkbox to prompt Renovate, waits for the rebased head to
+  become mergeable, then merges it. Renovate rebases conflicted pull requests
+  on its own too; the checkbox just makes it explicit.
+
+Polling backs off from a few seconds to five minutes while nothing is ready,
+and a refresh (a poll or a webhook delivery) wakes the worker early. A queued
+pull request that has not merged after six hours, or that GitHub calls
+mergeable yet keeps refusing, is dropped and its `queue_error` says why. The
+queue is saved to `.storage`, so a restart resumes it.
+
+**Merge immediately** is the original behaviour: one merge call, with any
+refusal shown as an error in the UI.
 
 ## Polling or webhook
 
@@ -106,8 +137,13 @@ fallback interval to `0` to rely on webhooks alone.
 - If Renovate's body has no change table, `latest_version` falls back to the
   version in the title, which is lossy on major bumps (`v2` rather than
   `v2.0.1`), and `installed_version` is unknown.
-- A merge failure — a conflict, a disabled merge method, required checks not yet
-  green — surfaces as an error in the UI with GitHub's response body.
+- In *Merge immediately* mode a merge failure — a conflict, a disabled merge
+  method, required checks not yet green — surfaces as an error in the UI with
+  GitHub's response body. In queue mode the same information lands in the
+  entity's `queue_error` attribute and the log.
+- Ticking the rebase checkbox edits the pull request body, which needs the
+  token's *Pull requests: Read and write* permission — the one it already has
+  for merging.
 - If the token later loses access, or was granted too little, the integration
   asks for a replacement through Home Assistant's reauthentication prompt rather
   than retrying forever.
